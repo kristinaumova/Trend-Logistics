@@ -1,0 +1,91 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy on server (git clone / pull in DEPLOY_PATH)
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          MONITORING_URL: ${{ secrets.MONITORING_URL }}
+          APP_DOMAIN: ${{ secrets.APP_DOMAIN || 'trend-logistics.ru' }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/trend_logistics' }}
+          GIT_REPO: ${{ github.repository }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_REF: ${{ github.ref_name }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          command_timeout: 45m
+          envs: GITHUB_TOKEN,JWT_SECRET,ADMIN_PASSWORD,MONITORING_URL,APP_DOMAIN,ACME_EMAIL,DEPLOY_PATH,GIT_REPO,GIT_SHA,GIT_REF
+          script: |
+            set -euo pipefail
+
+            DEPLOY_PATH="${DEPLOY_PATH:-/opt/trend_logistics}"
+            PARENT="$(dirname "$DEPLOY_PATH")"
+            mkdir -p "$PARENT"
+
+            # HTTPS + GITHUB_TOKEN: не нужен SCP и /tmp на runner; pull прямо на сервере
+            REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GIT_REPO}.git"
+
+            if [ -d "$DEPLOY_PATH" ] && [ ! -d "$DEPLOY_PATH/.git" ]; then
+              echo "Каталог $DEPLOY_PATH без .git (старый деплой через scp). Переименовываю в backup..."
+              mv "$DEPLOY_PATH" "${DEPLOY_PATH}.bak.$(date +%s)"
+            fi
+
+            if [ ! -d "$DEPLOY_PATH/.git" ]; then
+              echo "Первый деплой: git clone в $DEPLOY_PATH"
+              git clone "$REPO_URL" "$DEPLOY_PATH"
+            fi
+
+            cd "$DEPLOY_PATH"
+            git remote set-url origin "$REPO_URL"
+            git fetch --depth 1 origin "$GIT_SHA"
+            git -c advice.detachedHead=false checkout -f "$GIT_SHA"
+
+            export JWT_SECRET="${JWT_SECRET:-}"
+            if [ -z "${ADMIN_PASSWORD:-}" ]; then
+              echo "ERROR: задайте секрет ADMIN_PASSWORD в GitHub Actions"
+              exit 1
+            fi
+            export ADMIN_PASSWORD
+            export APP_DOMAIN="${APP_DOMAIN:-trend-logistics.ru}"
+            export ACME_EMAIL="${ACME_EMAIL:-admin@${APP_DOMAIN}}"
+            export GRAFANA_ROOT_URL="https://${APP_DOMAIN}/grafana/"
+            export MONITORING_URL="${MONITORING_URL:-/grafana/}"
+
+            # Compose V2 (docker compose) или legacy docker-compose
+            if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+              DC=(docker compose)
+            elif command -v docker-compose >/dev/null 2>&1; then
+              DC=(docker-compose)
+            else
+              echo "ERROR: не найден docker compose. На сервере выполните:"
+              echo "  sudo apt-get update && sudo apt-get install -y docker-compose-plugin"
+              echo "  docker compose version"
+              exit 1
+            fi
+            echo "Using: ${DC[*]}"
+
+            "${DC[@]}" down --remove-orphans || true
+            "${DC[@]}" build --no-cache frontend
+            "${DC[@]}" build backend external_data telemetry
+            "${DC[@]}" pull || true
+            "${DC[@]}" up -d --force-recreate
+
+            echo "OK: deployed ${GIT_SHA} (${GIT_REF}) in ${DEPLOY_PATH}"

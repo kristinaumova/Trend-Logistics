@@ -1,0 +1,200 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: trend
+      POSTGRES_PASSWORD: trend
+      POSTGRES_DB: trend_logistics
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trend -d trend_logistics"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    expose:
+      - "6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: trend
+      CLICKHOUSE_USER: trend
+      CLICKHOUSE_PASSWORD: trend
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    volumes:
+      - ch_data:/var/lib/clickhouse
+    expose:
+      - "8123"
+      - "9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user trend --password trend --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 40s
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    restart: unless-stopped
+    depends_on:
+      - backend
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://trend:trend@postgres:5432/trend_logistics
+      - REDIS_URL=redis://redis:6379/0
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=trend
+      - CLICKHOUSE_PASSWORD=trend
+      - CLICKHOUSE_DATABASE=trend
+      - JWT_SECRET=${JWT_SECRET:-change-me-in-production}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?Задайте ADMIN_PASSWORD в .env}
+      - MONITORING_URL=${MONITORING_URL:-}
+      - EXTERNAL_DATA_SERVICE_URL=http://external_data:8001
+      - TELEMETRY_SERVICE_URL=http://telemetry:8002
+      - FACTORS_CACHE_TTL_SECONDS=${FACTORS_CACHE_TTL_SECONDS:-1800}
+    volumes:
+      - backend_data:/app/data
+    expose:
+      - "80"
+    ports:
+      # Только localhost (отладка). Снаружи — HTTPS через Caddy :443
+      - "127.0.0.1:${APP_PUBLISH_PORT:-3000}:80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  external_data:
+    build:
+      context: .
+      dockerfile: Dockerfile.external_data
+    restart: unless-stopped
+    expose:
+      - "8001"
+    environment:
+      - EXTERNAL_DATA_USE_LIVE_WEATHER=${EXTERNAL_DATA_USE_LIVE_WEATHER:-false}
+      - EXTERNAL_DATA_USE_LIVE_TRAFFIC=${EXTERNAL_DATA_USE_LIVE_TRAFFIC:-false}
+      - EXTERNAL_DATA_USE_LIVE_GEOPOLITICS=${EXTERNAL_DATA_USE_LIVE_GEOPOLITICS:-false}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    network_mode: service:backend
+    depends_on:
+      - backend
+    environment:
+      - WAIT_BACKEND_URL=http://127.0.0.1:8000/healthz
+
+  telemetry:
+    build:
+      context: .
+      dockerfile: Dockerfile.telemetry
+    restart: unless-stopped
+    expose:
+      - "8002"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8002/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${ADMIN_PASSWORD:?Задайте ADMIN_PASSWORD в .env}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_ROOT_URL=${GRAFANA_ROOT_URL:-https://trend-logistics.ru/grafana/}
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_UID=trend-logistics-main
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      - DOMAIN=${APP_DOMAIN:-trend-logistics.ru}
+      - ACME_EMAIL=${ACME_EMAIL:-admin@trend-logistics.ru}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+      grafana:
+        condition: service_started
+
+volumes:
+  pg_data:
+  redis_data:
+  ch_data:
+  prom_data:
+  grafana_data:
+  backend_data:
+  caddy_data:
+  caddy_config:

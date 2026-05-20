@@ -1,0 +1,34 @@
+# Авто-HTTPS (Let's Encrypt). Переменные: DOMAIN, ACME_EMAIL (см. docker-compose).
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode gzip
+
+	# Grafana (subpath; GF_SERVER_SERVE_FROM_SUB_PATH=true)
+	@grafana path /grafana /grafana/*
+	handle @grafana {
+		reverse_proxy grafana:3000 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# SPA + API (nginx + uvicorn в контейнере backend)
+	handle {
+		reverse_proxy backend:80 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+}
+
+# Раскомментируйте, если для www настроена A/CNAME-запись на этот сервер
+# www.{$DOMAIN} {
+# 	redir https://{$DOMAIN}{uri} permanent
+# }
