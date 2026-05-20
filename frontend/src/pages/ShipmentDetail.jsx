@@ -248,7 +248,9 @@ export default function ShipmentDetail() {
   const canCancel = ['pending', 'in_transit', 'delayed'].includes(shipment.status)
   const nearDestination = completionStatus?.can_complete === true
   const delivery = shipment.delivery_summary
-  const mapCoordinates = telData?.coordinates?.length > 1 ? telData.coordinates : routeData?.coordinates
+  // Линию маршрута всегда берём из route API (OSRM/оценка), чтобы не рисовать прямую
+  // из телеметрийной эмуляции. Телеметрию используем только для текущей точки груза.
+  const mapCoordinates = routeData?.coordinates?.length > 1 ? routeData.coordinates : telData?.coordinates
   const cargoPosition = isDelivered
     ? routeData?.destination
       ? { lat: routeData.destination[0], lon: routeData.destination[1] }

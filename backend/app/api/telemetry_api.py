@@ -29,6 +29,52 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return r * c
 
 
+def _point_on_polyline(
+    coordinates: list[list[float]],
+    progress: float,
+) -> tuple[float, float] | None:
+    if len(coordinates) < 2:
+        return None
+    p = max(0.0, min(1.0, progress))
+    segments: list[float] = []
+    total_km = 0.0
+    for i in range(1, len(coordinates)):
+        lat1, lon1 = coordinates[i - 1]
+        lat2, lon2 = coordinates[i]
+        d = _haversine_km(float(lat1), float(lon1), float(lat2), float(lon2))
+        segments.append(d)
+        total_km += d
+    if total_km <= 0:
+        lat, lon = coordinates[0]
+        return float(lat), float(lon)
+    target = total_km * p
+    walked = 0.0
+    for i, seg_km in enumerate(segments):
+        if walked + seg_km >= target:
+            lat1, lon1 = coordinates[i]
+            lat2, lon2 = coordinates[i + 1]
+            if seg_km <= 0:
+                return float(lat1), float(lon1)
+            t = (target - walked) / seg_km
+            lat = float(lat1) + (float(lat2) - float(lat1)) * t
+            lon = float(lon1) + (float(lon2) - float(lon1)) * t
+            return lat, lon
+        walked += seg_km
+    lat, lon = coordinates[-1]
+    return float(lat), float(lon)
+
+
+def _polyline_total_km(coordinates: list[list[float]]) -> float:
+    if len(coordinates) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(coordinates)):
+        lat1, lon1 = coordinates[i - 1]
+        lat2, lon2 = coordinates[i]
+        total += _haversine_km(float(lat1), float(lon1), float(lat2), float(lon2))
+    return total
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -114,6 +160,30 @@ async def telemetry_for_shipment(
             "shipment_id": s.id,
             "shipment_status": s.status.value,
         }
+    route_coords = route_info.get("coordinates") if route_info else None
+    if route_coords and len(route_coords) > 1:
+        data["coordinates"] = route_coords
+        progress_raw = data.get("progress")
+        try:
+            progress = float(progress_raw) if progress_raw is not None else None
+        except (TypeError, ValueError):
+            progress = None
+        if progress is not None and s.status in _LIVE_STATUSES:
+            point = _point_on_polyline(route_coords, progress)
+            if point:
+                data["position"] = {"lat": round(point[0], 5), "lon": round(point[1], 5)}
+            total_km = _polyline_total_km(route_coords)
+            if total_km > 0:
+                remaining_km = max(0.0, total_km * (1.0 - max(0.0, min(1.0, progress))))
+                data["remaining_km"] = round(remaining_km, 1)
+                speed_raw = data.get("speed_kmh")
+                try:
+                    speed = float(speed_raw) if speed_raw is not None else None
+                except (TypeError, ValueError):
+                    speed = None
+                if speed and speed > 0:
+                    data["eta_hours_remaining"] = round(remaining_km / speed, 2)
+        data["source"] = "telemetry_emulation_on_osrm_route"
     data = _apply_shipment_status(data, s.status, dest)
     return {
         "available": True,
